@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Train TF-IDF + Random Forest and supervised MiniLM + LightGBM.
+
+    python src/ewoc_ttype/main_train.py --refresh
+    python src/ewoc_ttype/main_train.py --report EWOCTypePredArtifacts/<run-folder>
+
+Newest 15%: chronological test. Older 85%: grouped, stratified development split.
+Choose settings using validation, then refit on the older 85% before testing.
+MiniLM is fine-tuned on training labels; SMOTE runs on training vectors only.
+"""
+
+import argparse
+import json
+import logging
+import shutil
+import sys
+import warnings
+from datetime import datetime, timezone
+from importlib.metadata import version
+from inspect import signature
+from pathlib import Path
+
+import joblib
+import mlflow
+import numpy as np
+import pandas as pd
+import torch
+from imblearn.over_sampling import SMOTE
+from lightgbm import LGBMClassifier, early_stopping
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import batch_to_device
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.preprocessing import LabelEncoder, normalize
+from torch import nn
+from torch.utils.data import DataLoader
+from transformers.utils.logging import disable_progress_bar
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from ewoc_ttype.ewoc_utils import config, data_loader, mlflow_helpers
+else:
+    from .ewoc_utils import config, data_loader, mlflow_helpers
+
+ROOT = Path(__file__).resolve().parents[2]
+ENCODER_PATH = ROOT / "models/sentence-transformers/all-MiniLM-L6-v2"
+WHERE = """WHERE CREATED_DATE >= ADD_MONTHS(SYSDATE, -24)
+AND (CREATED_ID IS NULL OR CREATED_ID <> 1)"""
+SEED, TARGET, MAX_EPOCHS = config.RANDOM_STATE, 0.85, 3
+METRICS = ["accuracy", "macro_f1", "weighted_f1"]
+logger = logging.getLogger(__name__)
+
+
+def load_data(refresh):
+    orders = data_loader.fetch_full_table(
+        "e911.ENMT_E911_WORK_ORDERS", where_clause=WHERE, force_refresh=refresh)
+    types = data_loader.fetch_full_table("e911.LU_EWOC_TYPE", force_refresh=refresh)
+    names = types.set_index("TYPE_ID")["TYPE_WO"].dropna()
+    frame = orders[["DESCRIPTION", "TYPE_ID", "CREATED_DATE"]].copy()
+    frame["label"] = frame.TYPE_ID.map(names)
+    frame["CREATED_DATE"] = pd.to_datetime(frame.CREATED_DATE, format="mixed", errors="coerce")
+    frame = frame.dropna(subset=["DESCRIPTION", "label", "CREATED_DATE"])
+    frame = frame[~frame.DESCRIPTION.map(data_loader.insufficient_information)].copy()
+    frame["raw_description"] = frame.DESCRIPTION
+    frame["DESCRIPTION"] = frame.DESCRIPTION.map(data_loader.normalize_description)
+    frame = frame[frame.DESCRIPTION.str.strip().ne("")]
+    frame = frame.sort_values("CREATED_DATE", kind="stable").reset_index(drop=True)
+    return frame, {str(name): int(key) for key, name in names.items()}, len(orders)
+
+
+def split_data(frame):
+    """Preserve the time holdout; select development folds by coverage, never scores."""
+    if len(frame) < 10:
+        raise ValueError("Too few usable tickets for training, validation and test.")
+    cutoff = frame.CREATED_DATE.iloc[int(len(frame) * 0.85)]
+    development = frame[frame.CREATED_DATE < cutoff]
+    test = frame[frame.CREATED_DATE >= cutoff].copy()
+    if development.DESCRIPTION.nunique() < 5 or development.label.nunique() < 2:
+        raise ValueError("Need at least five distinct development texts and two classes.")
+    splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
+    expected = development.label.value_counts(normalize=True)
+    candidates = []
+    with warnings.catch_warnings():
+        # Rare classes are retained in training and disclosed in the run summary.
+        warnings.filterwarnings("ignore", message="The least populated class in y has only")
+        folds = list(splitter.split(development, development.label, development.DESCRIPTION))
+    for ti, vi in folds:
+        train, valid = development.iloc[ti], development.iloc[vi]
+        # Keep any class represented by just one text group in training.
+        missing = set(valid.label) - set(train.label)
+        move = valid.DESCRIPTION.isin(valid.loc[valid.label.isin(missing), "DESCRIPTION"])
+        train, valid = pd.concat([train, valid[move]]), valid[~move]
+        gap = (valid.label.value_counts(normalize=True).reindex(expected.index, fill_value=0)
+               - expected).abs().sum()
+        candidates.append(((len(set(expected.index) - set(valid.label)), gap), train, valid))
+    _, train, valid = min(candidates, key=lambda item: item[0])
+    # Repair missing validation classes when another independent text group is available.
+    for label in sorted(set(development.label) - set(valid.label)):
+        groups = train.groupby("label").DESCRIPTION.nunique()
+        for text in train.loc[train.label.eq(label), "DESCRIPTION"].unique():
+            move = train.DESCRIPTION.eq(text)
+            if (groups.loc[train.loc[move, "label"].unique()] > 1).all():
+                valid, train = pd.concat([valid, train[move]]), train[~move]
+                break
+    if valid.empty:
+        raise ValueError("No independent descriptions available for validation.")
+    return train.sort_index().copy(), valid.sort_index().copy(), test
+
+
+def balance_training(features, labels):
+    """At most double a class; k=5 only for classes with six distinct real vectors."""
+    counts = pd.Series(labels).value_counts()
+    targets = {}
+    for label, count in counts.items():
+        if count < 6 or count == counts.max():
+            continue
+        rows = features[np.asarray(labels) == label]
+        # Sparse TF-IDF stays sparse; repeated rows do not count as new evidence.
+        if hasattr(rows, "tocsr"):
+            rows = rows.tocsr()
+            distinct = {tuple(zip(row.indices, row.data)) for row in rows}
+        else:
+            distinct = {row.tobytes() for row in rows}
+        if len(distinct) >= 6:
+            targets[int(label)] = min(int(counts.max()), 2 * int(count))
+    if not targets:
+        return features, labels
+    features, labels = SMOTE(sampling_strategy=targets, k_neighbors=5,
+                             random_state=SEED).fit_resample(features, labels)
+    return normalize(features, copy=False), labels
+
+
+def encoder_epochs(frame, labels, epochs):
+    """Fine-tune all encoder weights using a temporary supervised classification head."""
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    encoder = SentenceTransformer(str(ENCODER_PATH), local_files_only=True)
+    if len(encoder.tokenizer) < 1000:
+        raise ValueError("MiniLM tokenizer is incomplete; check the local model folder.")
+    encoder.requires_grad_(True)
+    device = encoder.device
+    # Sentence Transformers 5/6 expose the same operations under different names.
+    dimension = getattr(encoder, "get_embedding_dimension", None) or encoder.get_sentence_embedding_dimension
+    tokenize = getattr(encoder, "preprocess", None) or encoder.tokenize
+    head = nn.Linear(dimension(), len(np.unique(labels))).to(device)
+    counts = np.bincount(labels)
+    weights = np.clip(np.sqrt(np.median(counts) / counts), 0.5, 3.0)
+    loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32, device=device))
+    optimizer = torch.optim.AdamW([
+        {"params": encoder.parameters(), "lr": 2e-5},
+        {"params": head.parameters(), "lr": 1e-3}], weight_decay=0.01)
+    batches = DataLoader(list(zip(frame.DESCRIPTION.tolist(), labels.tolist())),
+                         batch_size=16, shuffle=True, num_workers=0,
+                         generator=torch.Generator().manual_seed(SEED))
+    for epoch in range(1, epochs + 1):
+        encoder.train()
+        head.train()
+        for texts, target in batches:
+            inputs = batch_to_device(tokenize(list(texts)), device)
+            optimizer.zero_grad(set_to_none=True)
+            embeddings = encoder(inputs)["sentence_embedding"]  # encode() would disable gradients.
+            loss = loss_fn(head(embeddings), target.to(device))
+            loss.backward()
+            nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(head.parameters()), 1.0)
+            optimizer.step()
+        encoder.eval()
+        yield encoder, epoch
+
+
+def vectorize(kind, encoder, frame, fit=False):
+    if kind == "transformer":
+        return encoder.encode(frame.DESCRIPTION.tolist(), batch_size=64,
+                              normalize_embeddings=True, show_progress_bar=False)
+    return encoder.fit_transform(frame.DESCRIPTION) if fit else encoder.transform(frame.DESCRIPTION)
+
+
+def metric_values(actual, predicted):
+    # Default union of true/predicted labels: identical definition in every report.
+    return {"accuracy": accuracy_score(actual, predicted),
+            "macro_f1": f1_score(actual, predicted, average="macro", zero_division=0),
+            "weighted_f1": f1_score(actual, predicted, average="weighted", zero_division=0)}
+
+
+def selection_score(scores):
+    return min(scores[key] for key in METRICS)
+
+
+def lightgbm_metric(actual, probabilities):
+    predicted = (probabilities >= 0.5).astype(int) if probabilities.ndim == 1 else probabilities.argmax(axis=1)
+    return "joint_score", selection_score(metric_values(actual, predicted)), True
+
+
+def fit_classifier(kind, features, labels, estimators=None, validation=None):
+    features, labels = balance_training(features, labels)
+    if kind == "tfidf":
+        model = RandomForestClassifier(n_estimators=300, min_samples_leaf=2,
+                                       n_jobs=config.N_JOBS, random_state=SEED)
+        model.fit(features, labels)
+    else:
+        model = LGBMClassifier(
+            n_estimators=estimators or 1500, learning_rate=0.05, num_leaves=31,
+            min_child_samples=30, reg_lambda=1.0, colsample_bytree=0.9,
+            n_jobs=config.N_JOBS, random_state=SEED, metric="None",
+            deterministic=True, force_col_wise=True, verbosity=-1)
+        fit_args = {}
+        if validation is not None:
+            # LightGBM 4.7 renamed eval_set; support existing 4.x installations too.
+            fit_args = ({"eval_X": validation[0], "eval_y": validation[1]}
+                        if "eval_X" in signature(model.fit).parameters else {"eval_set": [validation]})
+            fit_args.update(eval_metric=lightgbm_metric,
+                            callbacks=[early_stopping(75, first_metric_only=True, verbose=False)])
+        model.fit(features, labels, **fit_args)
+    return model, len(labels)
+
+
+def evaluate(model, features, frame, labels, training_texts):
+    predicted = labels.inverse_transform(model.predict(features).astype(int))
+    scores = metric_values(frame.label, predicted)
+    unseen = ~frame.DESCRIPTION.isin(training_texts)
+    scores.update(rows=len(frame), unseen_label_rows=int((~frame.label.isin(labels.classes_)).sum()),
+                  new_description_rows=int(unseen.sum()))
+    if unseen.any():
+        scores["new_description_accuracy"] = accuracy_score(frame.label[unseen], predicted[unseen])
+    return scores, predicted
+
+
+def save_evaluation(destination, split, frame, predicted):
+    frame.assign(predicted=predicted, correct=predicted == frame.label.to_numpy()).to_csv(
+        destination / f"{split}_predictions.csv", index=False)
+    report = classification_report(frame.label, predicted, output_dict=True, zero_division=0)
+    observed = sorted(set(frame.label) | set(predicted))
+    filename = "class_metrics.csv" if split == "test" else "validation_class_metrics.csv"
+    pd.DataFrame({label: report[label] for label in observed}).T.to_csv(destination / filename, index_label="label")
+
+
+def print_summary(output):
+    comparison = pd.read_csv(output / "comparison.csv")
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    display = comparison[["model", "split", *METRICS]].copy()
+    display[METRICS] = display[METRICS].map(lambda value: f"{value:.1%}")
+    print("\n" + display.to_string(index=False))
+    winner = summary["validation_winner"]
+    scores = comparison[comparison.model.eq(winner) & comparison.split.eq("test")].iloc[0]
+    passed = selection_score(scores) > TARGET
+    print(f"Validation-selected model: {winner}; all three test metrics >85%: {'YES' if passed else 'NO'}")
+    missing, total = int(scores.unseen_label_rows), int(scores.rows)
+    print(f"Unseen test labels: {missing}/{total}; label-coverage ceiling: {1 - missing / total:.1%}")
+    counts = pd.read_csv(output / "class_counts.csv")
+    print(f"Training classes absent from validation: {int(((counts.train > 0) & (counts.validation == 0)).sum())}")
+    print(f"Files: {output.resolve()}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--refresh", action="store_true", help="Reload Oracle data")
+    parser.add_argument("--report", type=Path, help="Show an existing run without training")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(message)s", force=True)
+    disable_progress_bar()
+    logger.setLevel(logging.INFO)
+    for name in ("azure", "urllib3", "httpx", "sentence_transformers", "transformers", "mlflow"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    if args.report is not None:
+        print_summary(args.report)
+        return
+    config.validate_config()
+    mlflow_helpers.setup_mlflow()
+    run_name = "human_tickets_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    output = ROOT / "EWOCTypePredArtifacts" / run_name
+    output.mkdir(parents=True)
+    with mlflow.start_run(run_name=run_name):
+        frame, type_ids, fetched = load_data(args.refresh)
+        train, valid, test = split_data(frame)
+        final_train = pd.concat([train, valid]).sort_index()
+        labels = LabelEncoder().fit(train.label)
+        y_train, y_valid = labels.transform(train.label), labels.transform(valid.label)
+        joblib.dump(labels, output / "label_encoder.pkl")
+        (output / "type_name_to_id.json").write_text(json.dumps(type_ids, indent=2), encoding="utf-8")
+        pd.concat([part.assign(split=name) for name, part in
+                   [("train", train), ("validation", valid), ("test", test)]]).to_csv(output / "dataset.csv", index=False)
+        counts = pd.concat({"train": train.label.value_counts(), "validation": valid.label.value_counts(),
+                            "test": test.label.value_counts()}, axis=1).fillna(0).astype(int)
+        counts["final_train"] = counts.train + counts.validation
+        counts.to_csv(output / "class_counts.csv", index_label="label")
+        mlflow.log_params({"where": WHERE, "seed": SEED, "target": TARGET,
+                           "split": "newest_15pct_test; stratified_group_validation_within_older_85pct",
+                           "selection": "minimum_of_accuracy_macro_f1_weighted_f1",
+                           "smote": "max_2x; minimum_6_distinct_vectors; k_5; training_only",
+                           "fine_tuning": "supervised_cross_entropy; encoder_lr_2e-5; head_lr_1e-3; max_3_epochs"})
+        rows, settings, history = [], {}, []
+        for kind in ("tfidf", "transformer"):
+            logger.info("Developing %s: train=%d validation=%d", kind, len(train), len(valid))
+            destination = output / kind
+            destination.mkdir()
+            encoders = encoder_epochs(train, y_train, MAX_EPOCHS) if kind == "transformer" else [
+                (TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=20000,
+                                 sublinear_tf=True, dtype=np.float32), 0)]
+            best = -1
+            for encoder, epoch in encoders:
+                x_train, x_valid = vectorize(kind, encoder, train, fit=True), vectorize(kind, encoder, valid)
+                model, sampled = fit_classifier(kind, x_train, y_train, validation=(x_valid, y_valid))
+                scores, predicted = evaluate(model, x_valid, valid, labels, set(train.DESCRIPTION))
+                history.append({"model": kind, "epoch": epoch, **scores})
+                if selection_score(scores) > best:
+                    best, best_scores, best_predicted = selection_score(scores), scores, predicted
+                    settings[kind] = {"epochs": epoch,
+                                      "estimators": model.best_iteration_ if kind == "transformer" else 300}
+            rows.append({"model": kind, "split": "validation", **best_scores})
+            save_evaluation(destination, "validation", valid, best_predicted)
+            mlflow.log_params({kind + "_" + key: value for key, value in settings[kind].items()})
+            mlflow.log_metrics({kind + "_validation_" + key: value for key, value in best_scores.items()})
+            del encoder, model, x_train, x_valid, encoders
+
+        winner = max(rows, key=selection_score)["model"]  # Fixed before either test score is seen.
+        y_final = labels.transform(final_train.label)
+        for kind in ("tfidf", "transformer"):
+            logger.info("Refitting %s on %d tickets", kind, len(final_train))
+            destination = output / kind
+            if kind == "transformer":
+                # Reload the original MiniLM and retrain: development embeddings are now stale.
+                for encoder, _ in encoder_epochs(final_train, y_final, settings[kind]["epochs"]):
+                    pass
+                encoder.save(str(destination / "sentence_encoder"))
+            else:
+                encoder = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=20000,
+                                          sublinear_tf=True, dtype=np.float32)
+            x_final = vectorize(kind, encoder, final_train, fit=True)
+            x_test = vectorize(kind, encoder, test)
+            model, sampled = fit_classifier(kind, x_final, y_final, settings[kind]["estimators"])
+            joblib.dump(model, destination / "classifier.pkl")
+            if kind == "tfidf":
+                joblib.dump(encoder, destination / "tfidf_vectorizer.pkl")
+            scores, predicted = evaluate(model, x_test, test, labels, set(final_train.DESCRIPTION))
+            rows.append({"model": kind, "split": "test", **scores})
+            save_evaluation(destination, "test", test, predicted)
+            mlflow.log_metrics({kind + "_test_" + key: value for key, value in scores.items()})
+            mlflow.log_metric(kind + "_final_rows_after_smote", sampled)
+            del encoder, model, x_final, x_test
+
+        pd.DataFrame(rows).to_csv(output / "comparison.csv", index=False)
+        pd.DataFrame(history).to_csv(output / "validation_history.csv", index=False)
+        summary = {"validation_winner": winner, "settings": settings, "where": WHERE, "seed": SEED,
+                   "target": TARGET, "eligible_rows": len(frame), "excluded_unusable_rows": fetched - len(frame),
+                   "training_only_labels": sorted(set(train.label) - set(valid.label)),
+                   "test_start": str(test.CREATED_DATE.min()), "final_training_rows": len(final_train),
+                   "encoder_path": str(ENCODER_PATH), "final_training_splits": ["train", "validation"],
+                   "versions": {name: version(name) for name in ["numpy", "pandas", "scikit-learn",
+                                "imbalanced-learn", "sentence-transformers", "torch", "lightgbm", "mlflow", "joblib"]}}
+        (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        shutil.copy2(__file__, output / "main_train.py")
+        shutil.copy2(data_loader.__file__, output / "data_loader.py")
+        mlflow.set_tag("validation_winner", winner)
+        mlflow.log_artifacts(str(output))
+    print_summary(output)
+
+
+if __name__ == "__main__":
+    main()
