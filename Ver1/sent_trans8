@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Compare historical and 2026 training on one recent validation set.
+
+Run from ewoc_ticket_type: python src/ewoc_ttype/main_train.py
+Uses the latest human_tickets_*/dataset.csv, with its original test split.
+Optional: --reuse-splits EWOCTypePredArtifacts/human_tickets_<run>
+Requires the existing sklearn, imblearn, torch, transformers and MLflow environment.
+"""
+
+import argparse
+import hashlib
+import json
+import logging
+import shutil
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from importlib.metadata import version
+from pathlib import Path
+from threading import Event, Thread
+from time import perf_counter
+
+import joblib
+import numpy as np
+import pandas as pd
+from scipy.sparse import issparse
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.preprocessing import normalize
+from threadpoolctl import threadpool_limits
+
+ROOT = Path(__file__).resolve().parents[2]
+ENCODER_PATH = ROOT / "models/sentence-transformers/all-MiniLM-L6-v2"
+RECENT_START = pd.Timestamp("2026-01-01")  # Hypothesis to validate, not a label-mapping rule.
+SEED, TARGET, THREADS = 42, 0.85, 4
+METRICS = ["accuracy", "macro_f1", "weighted_f1"]
+logger = logging.getLogger("ewoc.training")
+
+
+@contextmanager
+def activity(message):
+    """One stage message, a 30-second heartbeat, and completion time."""
+    started, stop = perf_counter(), Event()
+    def heartbeat():
+        while not stop.wait(30):
+            logger.info("%s: running (%.0fs)", message, perf_counter() - started)
+    logger.info("%s...", message)
+    worker = Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join()
+    logger.info("%s: done in %.1fs", message, perf_counter() - started)
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def load_snapshot(source):
+    frame = pd.read_csv(source / "dataset.csv", keep_default_na=False)
+    required = {"DESCRIPTION", "label", "CREATED_DATE", "split"}
+    if not required <= set(frame):
+        raise ValueError(f"dataset.csv needs columns {sorted(required)}")
+    frame["CREATED_DATE"] = pd.to_datetime(frame.CREATED_DATE, format="mixed", errors="raise")
+    if (frame.CREATED_DATE.isna().any() or frame.DESCRIPTION.str.strip().eq("").any()
+            or frame.label.str.strip().eq("").any()):
+        raise ValueError("Use a cleaned human-ticket snapshot with dates, descriptions and labels.")
+    if "CREATED_ID" in frame and pd.to_numeric(frame.CREATED_ID, errors="coerce").eq(1).any():
+        raise ValueError("Snapshot includes CREATED_ID=1; use your already filtered human-ticket run.")
+    if set(frame.split) != {"train", "validation", "test"}:
+        raise ValueError("Snapshot must contain exactly train, validation and test splits.")
+    train, valid, test = [frame[frame.split.eq(name)].copy()
+                          for name in ("train", "validation", "test")]
+    if set(train.DESCRIPTION) & set(valid.DESCRIPTION):
+        raise ValueError("Training and validation share descriptions; use your grouped-split run.")
+    if max(train.CREATED_DATE.max(), valid.CREATED_DATE.max()) >= test.CREATED_DATE.min():
+        raise ValueError("Original test must be strictly later than all development tickets.")
+    return frame, train, valid, test
+
+
+def make_windows(train, valid):
+    common_valid = valid[valid.CREATED_DATE.ge(RECENT_START)].copy()
+    windows = {"historical": train, "recent": train[train.CREATED_DATE.ge(RECENT_START)]}
+    if common_valid.empty or any(part.label.nunique() < 2 for part in windows.values()):
+        raise ValueError("Need recent validation tickets and at least two training classes per window.")
+    return windows, common_valid
+
+
+def balance_training(features, labels):
+    """SMOTE only on fit data: at most 2x/class, never synthesize from <6 distinct vectors."""
+    labels = np.asarray(labels)
+    counts, targets = pd.Series(labels).value_counts(), {}
+    for label, count in counts.items():
+        if count < 6 or count == counts.max():
+            continue
+        rows = features[labels == label]
+        if issparse(rows):
+            rows = rows.tocsr(copy=True)
+            rows.eliminate_zeros()
+            rows.sort_indices()
+            distinct = {tuple(zip(row.indices, row.data)) for row in rows}
+        else:
+            distinct = {row.tobytes() for row in rows}
+        if len(distinct) >= 6:
+            targets[label] = min(int(counts.max()), 2 * int(count))
+    if not targets:
+        return features, labels
+    from imblearn.over_sampling import SMOTE
+
+    sampled, targets = SMOTE(sampling_strategy=targets, k_neighbors=5,
+                              random_state=SEED).fit_resample(features, labels)
+    return normalize(sampled, copy=False), targets
+
+
+def metric_values(actual, predicted):
+    # Same true/predicted label union in F1 and the saved classification report.
+    return {"accuracy": float(accuracy_score(actual, predicted)),
+            "macro_f1": float(f1_score(actual, predicted, average="macro", zero_division=0)),
+            "weighted_f1": float(f1_score(actual, predicted, average="weighted", zero_division=0))}
+
+
+def selection_score(scores):
+    return min(scores[key] for key in METRICS)
+
+
+def evaluate(frame, predicted, classes):
+    return {**metric_values(frame.label, predicted), "rows": len(frame),
+            "unseen_label_rows": int((~frame.label.isin(classes)).sum())}
+
+
+def vectorizer():
+    return TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=20000,
+                           sublinear_tf=True, dtype=np.float32)
+
+
+def fit_classifier(kind, features, labels, validation=None, settings=None):
+    features, labels = balance_training(features, labels)
+    if kind == "tfidf":
+        model = RandomForestClassifier(n_estimators=300, min_samples_leaf=2,
+                                        n_jobs=THREADS, random_state=SEED)
+        return model.fit(features, labels), {}, len(labels)
+    choices = ([settings] if settings is not None else
+               [{"C": c, "class_weight": weight} for c in (1.0, 10.0, 100.0)
+                for weight in (None, "balanced")])
+    best, selected, chosen = -1.0, None, None
+    with threadpool_limits(limits=THREADS):
+        for choice in choices:
+            model = LogisticRegression(**choice, solver="lbfgs", max_iter=1000, tol=1e-5)
+            model.fit(features, labels)
+            score = (selection_score(metric_values(validation[1], model.predict(validation[0])))
+                     if validation is not None else 0.0)
+            if score > best:
+                best, selected, chosen = score, model, choice
+    return selected, chosen, len(labels)
+
+
+class MiniLM:
+    """Original pretrained encoder, cached masked-mean embeddings; no contrastive refit."""
+
+    def __init__(self, path, cache):
+        self.path, self.cache, self.model = path, cache, None
+        assets = sorted(p for p in path.iterdir() if p.suffix in {".json", ".txt", ".bin", ".safetensors"})
+        if not any(p.suffix in {".bin", ".safetensors"} for p in assets):
+            raise FileNotFoundError(f"No local MiniLM weights in {path}")
+        digest = hashlib.sha256(b"masked_mean;l2;max256;v1")
+        for package in ("torch", "transformers"):
+            digest.update(f"{package}:{version(package)}".encode())
+        for asset in assets:
+            digest.update(asset.name.encode())
+            with asset.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+        self.fingerprint = digest.hexdigest()
+        cache.mkdir(parents=True, exist_ok=True)
+
+    def encode(self, texts, stage):
+        texts, inverse = np.unique(np.asarray(texts, dtype=str), return_inverse=True)
+        key = hashlib.sha256(self.fingerprint.encode())
+        key.update(json.dumps(texts.tolist(), ensure_ascii=False).encode("utf-8"))
+        cached = self.cache / (key.hexdigest() + ".npy")
+        if cached.exists():
+            logger.info("%s: using cached embeddings", stage)
+            return np.load(cached, allow_pickle=False)[inverse]
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
+        hf_logging.disable_progress_bar()
+        torch.set_num_threads(THREADS)
+        if self.model is None:
+            with activity("Loading local MiniLM"):
+                self.tokenizer = AutoTokenizer.from_pretrained(str(self.path), local_files_only=True)
+                self.model = AutoModel.from_pretrained(str(self.path), local_files_only=True).eval()
+                self.device = "cuda" if torch.cuda.is_available() else "cpu"
+                self.model.to(self.device)
+        with activity(f"{stage}: encoding {len(texts)} distinct descriptions on {self.device}"), torch.inference_mode():
+            vectors = []
+            for start in range(0, len(texts), 32):
+                inputs = self.tokenizer(texts[start:start + 32].tolist(), padding=True, truncation=True,
+                                        max_length=min(256, self.model.config.max_position_embeddings),
+                                        return_tensors="pt").to(self.device)
+                hidden = self.model(**inputs).last_hidden_state
+                mask = inputs["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1)
+                vectors.append(torch.nn.functional.normalize(pooled, dim=1).cpu().numpy())
+            vectors = np.concatenate(vectors).astype(np.float32)
+        temporary = cached.with_suffix(".tmp.npy")
+        np.save(temporary, vectors, allow_pickle=False)
+        temporary.replace(cached)
+        return vectors[inverse]
+
+    def save(self, destination):
+        destination.mkdir()
+        for asset in self.path.iterdir():
+            if asset.suffix in {".json", ".txt", ".bin", ".safetensors"}:
+                shutil.copy2(asset, destination / asset.name)
+
+
+def save_evaluation(destination, split, frame, predicted):
+    frame.assign(predicted=predicted, correct=predicted == frame.label.to_numpy()).to_csv(
+        destination / f"{split}_predictions.csv", index=False)
+    report = classification_report(frame.label, predicted, output_dict=True, zero_division=0)
+    classes = sorted(set(frame.label) | set(predicted))
+    pd.DataFrame({label: report[label] for label in classes}).T.to_csv(
+        destination / f"{split}_class_metrics.csv", index_label="label")
+
+
+def train_comparison(source, output, encoder):
+    frame, train, valid, test = load_snapshot(source)
+    windows, common_valid = make_windows(train, valid)
+    development = pd.concat([train, valid]).sort_index()
+    logger.info("Training: historical=%d recent=%d; shared recent validation=%d; unchanged test=%d",
+                len(train), len(windows["recent"]), len(common_valid), len(test))
+    output.mkdir(parents=True)
+    for name in ("dataset.csv", "type_name_to_id.json"):
+        shutil.copy2(source / name, output / name)
+    # Encode development once; no fit, SMOTE, tuning or selection uses the test set.
+    encoded = encoder.encode(development.DESCRIPTION, "Development")
+    positions = pd.Series(np.arange(len(development)), index=development.index)
+    x_valid = encoded[positions.loc[common_valid.index].to_numpy()]
+    history, selected, validation_predictions = [], {}, {}
+    for kind in ("tfidf", "transformer"):
+        for window, part in windows.items():
+            with activity(f"Developing {kind} / {window}"):
+                if kind == "tfidf":
+                    vocab = vectorizer()
+                    x_train = vocab.fit_transform(part.DESCRIPTION)
+                    x_eval = vocab.transform(common_valid.DESCRIPTION)
+                else:
+                    x_train = encoded[positions.loc[part.index].to_numpy()]
+                    x_eval = x_valid
+                model, settings, sampled_rows = fit_classifier(
+                    kind, x_train, part.label, validation=(x_eval, common_valid.label))
+                predicted = model.predict(x_eval)
+                scores = evaluate(common_valid, predicted, model.classes_)
+            candidate = {"model": kind, "window": window, "settings": settings, **scores,
+                         "fit_rows": len(part), "after_smote": sampled_rows}
+            history.append(candidate)
+            if kind not in selected or selection_score(candidate) > selection_score(selected[kind]):
+                selected[kind] = candidate
+                validation_predictions[kind] = predicted
+    winner = max(selected, key=lambda kind: selection_score(selected[kind]))
+    selection = {"validation_winner": winner, "selected": selected, "recent_start": str(RECENT_START.date()),
+                 "source": str(source.resolve()), "selection": "min(accuracy, macro_f1, weighted_f1)",
+                 "test_used_for_selection": False, "encoder_sha256": encoder.fingerprint}
+    # Persist choices before encoding the test or calculating either test score.
+    write_json(output / "selection.json", selection)
+    pd.DataFrame(history).to_csv(output / "validation_results.csv", index=False)
+    test_vectors = encoder.encode(test.DESCRIPTION, "Test")
+    results = []
+    for kind, choice in selected.items():
+        destination = output / kind
+        destination.mkdir()
+        final = (development if choice["window"] == "historical" else
+                 development[development.CREATED_DATE.ge(RECENT_START)])
+        with activity(f"Refitting selected {kind} / {choice['window']} on {len(final)} tickets"):
+            if kind == "tfidf":
+                vocab = vectorizer()
+                x_train = vocab.fit_transform(final.DESCRIPTION)
+                x_test = vocab.transform(test.DESCRIPTION)
+                joblib.dump(vocab, destination / "tfidf_vectorizer.pkl")
+            else:
+                x_train = encoded[positions.loc[final.index].to_numpy()]
+                x_test = test_vectors
+                encoder.save(destination / "encoder")
+            model, _, sampled_rows = fit_classifier(kind, x_train, final.label, settings=choice["settings"])
+            joblib.dump(model, destination / "classifier.pkl")  # Predicts type names directly.
+            predicted = model.predict(x_test)
+        scores = evaluate(test, predicted, model.classes_)
+        results.append({"model": kind, "window": choice["window"], **scores})
+        save_evaluation(destination, "test", test, predicted)
+        save_evaluation(destination, "validation", common_valid, validation_predictions[kind])
+        write_json(destination / "model_config.json", {
+            "window": choice["window"], "settings": choice["settings"],
+            "classes": model.classes_.tolist(), "training_rows": len(final), "after_smote": sampled_rows,
+            "input": "Existing data_loader.normalize_description output; DESCRIPTION reused unchanged",
+            "pooling": "masked_mean_then_l2" if kind == "transformer" else None,
+            "max_length": 256 if kind == "transformer" else None})
+    pd.DataFrame(results).to_csv(output / "test_results.csv", index=False)
+    write_json(output / "summary.json", {**selection, "test_results": results, "target": TARGET,
+                                        "seed": SEED, "eligible_rows": len(frame)})
+    shutil.copy2(__file__, output / "main_train.py")
+    display = pd.DataFrame([{**row, "split": "validation"} for row in selected.values()] +
+                           [{**row, "split": "test"} for row in results])
+    print("\n" + display[["model", "window", "split", *METRICS]].to_string(
+        index=False, formatters={key: "{:.1%}".format for key in METRICS}), flush=True)
+    chosen = next(row for row in results if row["model"] == winner)
+    print(f"Validation-selected model: {winner}; all test metrics >85%: {selection_score(chosen) > TARGET}")
+    print(f"Unseen test labels: {chosen['unseen_label_rows']}/{len(test)}; all test rows included.")
+    print(f"Files: {output.resolve()}", flush=True)
+    return selection, results
+
+
+def log_mlflow(output, selection, results):
+    import mlflow
+    if __package__ in {None, ""}:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from ewoc_ttype.ewoc_utils import mlflow_helpers
+    else:
+        from .ewoc_utils import mlflow_helpers
+    try:
+        with activity("Saving completed results to MLflow"):
+            mlflow_helpers.setup_mlflow()
+            with mlflow.start_run(run_name=output.name):
+                mlflow.log_params({"recent_start": selection["recent_start"], "seed": SEED,
+                                   "selection": selection["selection"], "smote": "k5; >=6 distinct; max2x"})
+                mlflow.set_tag("validation_winner", selection["validation_winner"])
+                for row in list(selection["selected"].values()) + results:
+                    split = "validation" if "settings" in row else "test"
+                    mlflow.log_metrics({f"{row['model']}_{split}_{key}": row[key] for key in METRICS})
+                mlflow.log_artifacts(str(output))
+    except mlflow.exceptions.MlflowException as error:
+        logger.warning("MLflow upload failed (%s); completed models/results are saved at %s", error, output)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reuse-splits", type=Path, help="Existing human-ticket run folder")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", force=True)
+    logger.setLevel(logging.INFO)
+    artifacts = ROOT / "EWOCTypePredArtifacts"
+    snapshots = sorted(artifacts.glob("human_tickets_*/dataset.csv"))
+    if args.reuse_splits is None and not snapshots:
+        parser.error("No saved human-ticket dataset found. Pass --reuse-splits <existing-run-folder>.")
+    source = args.reuse_splits if args.reuse_splits is not None else snapshots[-1].parent
+    output = artifacts / ("recent_comparison_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f"))
+    logger.info("Reusing %s", source)
+    with activity("Checking local encoder and embedding cache"):
+        encoder = MiniLM(ENCODER_PATH, artifacts / "minilm_embedding_cache")
+    selection, results = train_comparison(source, output, encoder)
+    log_mlflow(output, selection, results)
+
+
+if __name__ == "__main__":
+    main()
