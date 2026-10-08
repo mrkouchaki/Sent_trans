@@ -1,7 +1,7 @@
 
 
 
-
+.\.venv\Scripts\python.exe -c "import sys; print('Python:', sys.version); import tensorflow as tf; model = tf.saved_model.load('./models/bert_tf'); print('TensorFlow BERT loaded OK')"
 
 
 
