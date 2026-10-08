@@ -1,0 +1,3 @@
+
+
+curl.exe -sS -i --max-time 30 --proxy "http://cso.proxy.att.com:8888" --noproxy "localhost" "https://huggingface.co/api/models/google-bert/bert-base-uncased/revision/main"
