@@ -1,6 +1,36 @@
 
 
 
+
+
+@'
+import tensorflow as tf
+from transformers import BertTokenizer
+
+tokenizer = BertTokenizer(
+    vocab_file="./models/bert_tf/assets/vocab.txt",
+    do_lower_case=True
+)
+tokens = tokenizer(
+    ["This ticket needs investigation."],
+    padding="max_length", truncation=True, max_length=32
+)
+
+model = tf.saved_model.load("./models/bert_tf")
+outputs = model({
+    "input_word_ids": tf.constant(tokens["input_ids"], dtype=tf.int32),
+    "input_mask": tf.constant(tokens["attention_mask"], dtype=tf.int32),
+    "input_type_ids": tf.constant(tokens["token_type_ids"], dtype=tf.int32)
+}, training=False)
+
+print("Embedding shape:", outputs["pooled_output"].shape)
+'@ | .\.venv\Scripts\python.exe -
+
+
+
+
+
+
 .\.venv\Scripts\python.exe -c "import sys; print('Python:', sys.version); import tensorflow as tf; model = tf.saved_model.load('./models/bert_tf'); print('TensorFlow BERT loaded OK')"
 
 
