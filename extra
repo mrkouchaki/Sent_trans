@@ -1,3 +1,21 @@
 
 
+
+
+
+
+
+$env:HTTPS_PROXY = "http://cso.proxy.att.com:8888"
+$env:HTTP_PROXY = "http://cso.proxy.att.com:8888"
+
+curl.exe -sS -i --ssl-revoke-best-effort --max-time 30 --proxy "http://cso.proxy.att.com:8888" --noproxy "localhost" "https://huggingface.co/api/models/google-bert/bert-base-uncased/revision/main"
+
+
+
+
+
+
+
+
+
 curl.exe -sS -i --max-time 30 --proxy "http://cso.proxy.att.com:8888" --noproxy "localhost" "https://huggingface.co/api/models/google-bert/bert-base-uncased/revision/main"
