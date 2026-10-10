@@ -1,5 +1,12 @@
 
 
+.\.venv\Scripts\python.exe .\bert_register_saved.py `
+  --trainer .\src\ewoc_ttype\bert_train4.py `
+  --checkpoint-dir "$env:USERPROFILE\bert_runs\20261009_121959_ca882017\checkpoints" `
+  --target-stage Staging `
+  --run-name "BERT_v2_recovered"
+
+
 
 
 
