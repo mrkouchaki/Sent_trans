@@ -1,7 +1,19 @@
 """Fine-tune local TensorFlow BERT and register an API-compatible MLflow model.
 
-Place this file at src/ewoc_ttype/bert_train.py and run from ewoc_ticket_type:
-  .\\.venv\\Scripts\\python.exe .\\src\\ewoc_ttype\\bert_train.py --target-stage Staging
+Place this file at src/ewoc_ttype/bert_train_v7.py and run from ewoc_ticket_type:
+  .\\.venv\\Scripts\\python.exe .\\src\\ewoc_ttype\\bert_train_v7.py --target-stage Staging
+
+V7 adds monitoring only: full validation every VALIDATE_EVERY_BATCHES training
+microbatches shown in the terminal, plus epoch-end validation. Set it to 0 for
+epoch-end only. Checks wait for an optimizer update when gradient accumulation
+is in progress; 1000 is already divisible by the default accumulation of 8.
+Mid-epoch results do not change early stopping, best-model selection or epoch
+checkpoint saving. The test set is still used only for the final evaluation.
+Progress is printed, appended to checkpoints/bert_training_state/validation_progress.jsonl,
+and logged live to MLflow as progress_val_* metrics, with total training batches
+as their step. Extra validation adds CPU time; it does not change training settings.
+V6 completed-epoch checkpoints remain compatible with identical data/settings.
+An already running Python process cannot pick up this change by editing its file.
 
 Edit the USER SETTINGS block below. Defaults: data/ewoc_training_merged_unique.csv,
 at most 3,000 TRAINING rows per TYPE_ID, 12 CPU threads, five epochs.
@@ -101,6 +113,7 @@ LOCAL_TRAINING_CSV = "data/ewoc_training_merged_unique.csv"
 LOCAL_TYPE_LOOKUP_CSV = "ExtractedData/e911_LU_EWOC_TYPE.csv"
 MAX_TRAIN_ROWS_PER_TYPE_ID = 3000  # e.g. 2000; None disables the cap
 DEFAULT_THREADS = 12
+VALIDATE_EVERY_BATCHES = 1000     # terminal microbatches; 0 = epoch-end only
 LABEL_SMOOTHING = 0.05            # light regularization; 0.0 disables it
 HEAD_HIDDEN_SIZE = 128           # 128 = GELU hidden layer; 0 = previous linear head
 HEAD_DROPOUT = 0.10
@@ -525,8 +538,13 @@ class BertClassifier:
         return result, counts
 
     def fit(self, texts, labels, sample_weight=None, checkpoint_dir=None, validation_data=None,
-            preflight_only=False):
+            preflight_only=False, *, eval_every_batches=0, evaluation_callback=None):
         self._validate_settings()
+        if (isinstance(eval_every_batches, bool)
+                or not isinstance(eval_every_batches, (int, np.integer)) or eval_every_batches < 0):
+            raise ValueError("eval_every_batches must be a nonnegative integer; 0 means epoch-end only.")
+        if evaluation_callback is not None and not callable(evaluation_callback):
+            raise ValueError("evaluation_callback must be callable or None.")
         texts = _texts(texts)
         labels = _labels(labels, len(texts))
         self.classes_, targets = np.unique(labels, return_inverse=True)
@@ -584,9 +602,8 @@ class BertClassifier:
             raise ValueError("All training tokens are [UNK]; check the vocabulary before training.")
         self._backend.configure()
         self.source_fingerprint_ = _digest_model(self.model_name)
-        signature = {"format": FORMAT_VERSION, "backend": self.backend_,
-                     "source": self.model_name, "revision": self.revision,
-                     "source_fingerprint": self.source_fingerprint_,
+        signature = {"format": FORMAT_VERSION, "backend": self.backend_, "source": self.model_name,
+                     "revision": self.revision, "source_fingerprint": self.source_fingerprint_,
                      "settings": self._settings(), "classes": self.classes_.tolist(),
                      "train": _digest_rows(texts, labels, weights),
                      "validation": _digest_rows(val_texts, val_labels)}
@@ -628,12 +645,48 @@ class BertClassifier:
             logger.info("%s [%s/%s]: %d rows, %d classes, max_length=%d, effective batch=%d, selection=%s",
                         self.name, self.backend_, self.device, len(texts), len(self.classes_), self.max_length,
                         self.batch_size * self.accumulation, self.training_text_counts)
+            if val_encoded and eval_every_batches:
+                logger.info("Full validation every %d training batches (after an optimizer update), "
+                            "plus epoch end. Early stopping/checkpoints remain epoch-based. "
+                            "Progress: %s", eval_every_batches, root / "validation_progress.jsonl")
+
+            def validate_progress(epoch, batch, kind):
+                logger.info("Validation starting: epoch %d/%d batch %d/%d (%s), %d rows",
+                            epoch + 1, self.epochs, batch, batches, kind, len(val_labels))
+                validation_started = perf_counter()
+                metrics, predicted = self._validation_metrics(val_encoded, val_labels)
+                progress = {"epoch": epoch + 1, "batch": batch, "batches_per_epoch": batches,
+                            "global_batch": epoch * batches + batch,
+                            "optimizer_step": state["global_step"], "kind": kind,
+                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                            "validation_rows": len(val_labels),
+                            "validation_seconds": perf_counter() - validation_started, **metrics}
+                logger.info("Validation epoch %d/%d batch %d/%d (%s): macro-F1 %.4f, "
+                            "weighted-F1 %.4f, accuracy %.4f, log-loss %.4f (%.1f s)",
+                            epoch + 1, self.epochs, batch, batches, kind,
+                            metrics["val_macro_f1"], metrics["val_weighted_f1"],
+                            metrics["val_accuracy"], metrics["val_log_loss"], progress["validation_seconds"])
+                # Monitoring must not discard trained weights if a log write fails.
+                try:
+                    with (root / "validation_progress.jsonl").open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(progress, ensure_ascii=False, allow_nan=False) + "\n")
+                except OSError as exc:
+                    logger.warning("Could not append validation progress at %s: %s", root, exc)
+                if evaluation_callback is not None:
+                    try:
+                        evaluation_callback(dict(progress))
+                    except Exception as exc:
+                        logger.warning("Validation progress callback failed; training continues. "
+                                       "Local progress path: %s. Error: %s", root, exc)
+                return metrics, predicted
+
             for epoch in range(state["next_epoch"], self.epochs):
                 if state["stopped_early"]:
                     break
                 order = np.random.default_rng(self.seed + epoch).permutation(len(targets))
                 self._backend.start_epoch(epoch)
                 started, last_log, loss_sum, seen = perf_counter(), perf_counter(), 0.0, 0
+                next_validation_batch = eval_every_batches
                 for step, offset in enumerate(range(0, len(order), self.batch_size)):
                     indices = order[offset:offset + self.batch_size]
                     group_start = (step // self.accumulation) * self.accumulation * self.batch_size
@@ -644,6 +697,13 @@ class BertClassifier:
                     if (step + 1) % self.accumulation == 0 or step + 1 == batches:
                         self._backend.update(_lr_scale(state["global_step"], total_steps, self.warmup_ratio))
                         state["global_step"] += 1
+                        if (val_encoded and eval_every_batches and step + 1 >= next_validation_batch
+                                and step + 1 < batches):
+                            validate_progress(epoch, step + 1, "mid_epoch")
+                            # Skip already crossed thresholds, rather than repeating
+                            # validation on the same weights. The last batch is
+                            # evaluated once by the existing epoch-end path.
+                            next_validation_batch = ((step + 1) // eval_every_batches + 1) * eval_every_batches
                     if perf_counter() - last_log >= 30 or step + 1 == batches:
                         elapsed = perf_counter() - started
                         logger.info("%s epoch %d/%d batch %d/%d loss %.4f ETA %.1f min", self.name,
@@ -653,16 +713,10 @@ class BertClassifier:
                 record = {"epoch": epoch + 1, "train_loss": loss_sum / seen,
                           "seconds": perf_counter() - started}
                 if val_encoded:
-                    probabilities = self._probabilities(val_encoded)
-                    predicted = self.classes_[probabilities.argmax(axis=1)]
-                    score = float(f1_score(val_labels, predicted, labels=self.classes_, average="macro", zero_division=0))
-                    record.update(val_macro_f1=score,
-                                  val_weighted_f1=float(f1_score(val_labels, predicted, average="weighted", zero_division=0)),
-                                  val_accuracy=float(accuracy_score(val_labels, predicted)),
-                                  val_log_loss=float(log_loss(val_labels, probabilities, labels=self.classes_)))
+                    metrics, predicted = validate_progress(epoch, batches, "epoch_end")
+                    score = metrics["val_macro_f1"]
+                    record.update(metrics)
                     improved = state["best_score"] is None or score > state["best_score"] + self.min_delta
-                    logger.info("Validation: macro-F1 %.4f, weighted-F1 %.4f, accuracy %.4f", score,
-                                record["val_weighted_f1"], record["val_accuracy"])
                     # Retain diagnostics even if the subsequent checkpoint save fails.
                     diagnostics = {"metrics": record, "tokenizer": self.tokenizer_diagnostics_,
                                    "class_report": classification_report(
@@ -687,6 +741,17 @@ class BertClassifier:
         finally:
             if temporary is not None:
                 temporary.cleanup()
+
+    def _validation_metrics(self, encoded, labels):
+        # Inference only: no dropout, gradient updates or training-loss resets.
+        probabilities = self._probabilities(encoded)
+        predicted = self.classes_[probabilities.argmax(axis=1)]
+        metrics = {"val_macro_f1": float(f1_score(labels, predicted, labels=self.classes_,
+                                                average="macro", zero_division=0)),
+                   "val_weighted_f1": float(f1_score(labels, predicted, average="weighted", zero_division=0)),
+                   "val_accuracy": float(accuracy_score(labels, predicted)),
+                   "val_log_loss": float(log_loss(labels, probabilities, labels=self.classes_))}
+        return metrics, predicted
 
     def _probabilities(self, encoded):
         rows = []
@@ -1201,6 +1266,12 @@ def load_training_frame(args, data_loader):
     return frame
 
 
+def _log_progress_metrics(record):
+    """Keep live batch-step metrics separate from the existing epoch-step keys."""
+    mlflow.log_metrics({f"progress_{key}": float(value) for key, value in record.items()
+                        if key.startswith("val_")}, step=int(record["global_batch"]))
+
+
 def run_training(args, config, data_loader, mlflow_helpers):
     """Injectable project adapters also permit isolated integration testing."""
     if Version(mlflow.__version__) < Version("2.12.2"):
@@ -1254,6 +1325,9 @@ def run_training(args, config, data_loader, mlflow_helpers):
         mlflow.set_tags({"model_family": "tensorflow_bert_finetuned", "registration_status": "training",
                          "classification_target": LABEL_COLUMN})
         mlflow.log_params({**classifier._settings(), "model_name": args.model_name,
+                           "validate_every_batches": VALIDATE_EVERY_BATCHES,
+                           "validation_interval_unit": "training_microbatches_within_epoch",
+                           "early_stopping_scope": "epoch_end_validation_macro_f1",
                            "bert_source": str(source), "test_size": test_size,
                            "validation_size_within_train": args.validation_size,
                            "data_source": str(_project_path(args.data_csv)) if args.data_csv else "project_tables",
@@ -1298,7 +1372,12 @@ def run_training(args, config, data_loader, mlflow_helpers):
             logger.info("Rows: train=%d validation=%d test=%d; classes=%d", len(train), len(validation), len(test), len(mapping))
             classifier.fit(train[TEXT_COLUMN].map(bert_text).tolist(), train[LABEL_COLUMN].tolist(),
                            validation_data=(validation[TEXT_COLUMN].map(bert_text).tolist(), validation[LABEL_COLUMN].tolist()),
-                           checkpoint_dir=checkpoint, preflight_only=args.preflight_only)
+                           checkpoint_dir=checkpoint, preflight_only=args.preflight_only,
+                           eval_every_batches=VALIDATE_EVERY_BATCHES,
+                           evaluation_callback=_log_progress_metrics)
+            progress_path = checkpoint / "bert_training_state" / "validation_progress.jsonl"
+            if progress_path.is_file():
+                shutil.copyfile(progress_path, output / "validation_progress.jsonl")
             write_json(output / "tokenizer_diagnostics.json", classifier.tokenizer_diagnostics_)
             mlflow.log_artifact(str(output / "tokenizer_diagnostics.json"), artifact_path="training")
             if args.preflight_only:
@@ -1323,6 +1402,9 @@ def run_training(args, config, data_loader, mlflow_helpers):
                        "best_epoch": classifier.best_epoch_,
                        "best_validation_macro_f1": classifier.best_validation_macro_f1_,
                        "stopped_early": classifier.stopped_early_, "training_text_counts": classifier.training_text_counts,
+                       "monitoring": {"validate_every_batches": VALIDATE_EVERY_BATCHES,
+                                      "interval_unit": "training_microbatches_within_epoch",
+                                      "selection_and_early_stopping": "epoch_end_only"},
                        "tokenizer_diagnostics": classifier.tokenizer_diagnostics_,
                        "metrics": metrics, "confidence_calibration": "uncalibrated_softmax",
                        "history": classifier.history_}
