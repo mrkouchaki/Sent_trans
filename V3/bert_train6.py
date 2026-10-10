@@ -1,19 +1,7 @@
 """Fine-tune local TensorFlow BERT and register an API-compatible MLflow model.
 
-Place this file at src/ewoc_ttype/bert_train_v7.py and run from ewoc_ticket_type:
-  .\\.venv\\Scripts\\python.exe .\\src\\ewoc_ttype\\bert_train_v7.py --target-stage Staging
-
-V7 adds monitoring only: full validation every VALIDATE_EVERY_BATCHES training
-microbatches shown in the terminal, plus epoch-end validation. Set it to 0 for
-epoch-end only. Checks wait for an optimizer update when gradient accumulation
-is in progress; 1000 is already divisible by the default accumulation of 8.
-Mid-epoch results do not change early stopping, best-model selection or epoch
-checkpoint saving. The test set is still used only for the final evaluation.
-Progress is printed, appended to checkpoints/bert_training_state/validation_progress.jsonl,
-and logged live to MLflow as progress_val_* metrics, with total training batches
-as their step. Extra validation adds CPU time; it does not change training settings.
-V6 completed-epoch checkpoints remain compatible with identical data/settings.
-An already running Python process cannot pick up this change by editing its file.
+Place this file at src/ewoc_ttype/bert_train_v6.py and run from ewoc_ticket_type:
+  .\\.venv\\Scripts\\python.exe .\\src\\ewoc_ttype\\bert_train_v6.py --target-stage Staging
 
 Edit the USER SETTINGS block below. Defaults: data/ewoc_training_merged_unique.csv,
 at most 3,000 TRAINING rows per TYPE_ID, 12 CPU threads, five epochs.
@@ -21,6 +9,21 @@ CSV requires DESCRIPTION and TYPE_ID plus WorkOrder_Info (or TYPE_WO).
 If type names are absent, LOCAL_TYPE_LOOKUP_CSV supplies them without a DB query.
 CSV paths are relative to the ewoc_ticket_type project root. Set LOCAL_TRAINING_CSV
 to None to use the previous Oracle/cached-table path. --data-csv can override it.
+IS_SYNTHETIC is case-insensitive: TRUE rows are eligible only for training;
+FALSE rows supply real training, validation and test data. Boolean values and
+0/1 are accepted; missing or unrecognized values in an existing flag column
+raise an error. If the column is absent, all rows are treated as real (logged).
+Synthetic rows may have missing CREATED_DATE values and are retained.
+TRAIN_RATIO / VALIDATION_RATIO / TEST_RATIO below must be positive and sum to 1.
+Defaults are 70/15/15 of REAL description groups, before adding synthetic rows
+and before the training cap. Grouping means actual row fractions may differ.
+First split real rows, then append synthetic rows that do not match held-out
+normalized descriptions or BERT input text. The final training set mixes real
+and synthetic rows; validation, early stopping, and test metrics use real rows.
+The flag alone does not identify synthetic paraphrases of a held-out source
+ticket. Such derivatives should be generated only from real training tickets;
+this script can check duplicate text/groups but cannot infer their ancestry.
+No SMOTE is used. Start a fresh run after changing data flags or split ratios.
 The cap is applied AFTER grouped train/validation/test splitting. Smaller classes
 are kept, rows are sampled reproducibly, and validation/test are never capped.
 Set MAX_TRAIN_ROWS_PER_TYPE_ID to 2000, another positive integer, or None (no cap).
@@ -61,9 +64,12 @@ and MLflow. These project modules are needed for training only, not inference.
 No Random Forest, TF-IDF model or MiniLM is trained. No model download is needed.
 The TensorFlow encoder AND a new classification head receive gradients.
 Requires MLflow >= 2.12.2 for source-based inference packaging.
-Integration-tested with TensorFlow 2.21.0, Transformers 4.57.1 / 5.0.0 and MLflow 2.22.2
+The original trainer was integration-tested with TensorFlow 2.21.0,
+Transformers 4.57.1 / 5.0.0 and MLflow 2.22.2
 using a small real TensorFlow encoder and a local MLflow registry. The actual
 Kaggle checkpoint, Oracle data and deployed API are not available in this test.
+This data-split update is separately tested with pandas/scikit-learn fixtures;
+the full TensorFlow training and remote MLflow registration were not rerun.
 
 MLflow predict contract:
   input: pandas DataFrame containing DESCRIPTION
@@ -90,10 +96,9 @@ The supplied RF trainer also reads config.MODEL_NAME. If you run that trainer
 again after switching the shared config to BERT, give RF its own registry name
 first so it does not register a Random Forest under the BERT name.
 
-Selection uses a grouped validation set within the outer training partition;
-the outer test partition is reserved for final evaluation. The outer split
-matches the supplied RF code's GroupShuffleSplit when data/order/normalization,
-TEST_SIZE and RANDOM_STATE are identical. Results do not guarantee superiority.
+Selection uses real-only grouped validation; real-only test is reserved for
+final evaluation. Compare models on the same saved real holdout, not old runs
+whose validation/test included synthetic rows. Results do not guarantee superiority.
 """
 
 import hashlib
@@ -112,8 +117,12 @@ from time import perf_counter, sleep
 LOCAL_TRAINING_CSV = "data/ewoc_training_merged_unique.csv"
 LOCAL_TYPE_LOOKUP_CSV = "ExtractedData/e911_LU_EWOC_TYPE.csv"
 MAX_TRAIN_ROWS_PER_TYPE_ID = 3000  # e.g. 2000; None disables the cap
+# Fractions of REAL description groups BEFORE adding synthetic training rows.
+# All three must be > 0 and sum to 1. Example: 0.80 / 0.10 / 0.10.
+TRAIN_RATIO = 0.70
+VALIDATION_RATIO = 0.15
+TEST_RATIO = 0.15
 DEFAULT_THREADS = 12
-VALIDATE_EVERY_BATCHES = 1000     # terminal microbatches; 0 = epoch-end only
 LABEL_SMOOTHING = 0.05            # light regularization; 0.0 disables it
 HEAD_HIDDEN_SIZE = 128           # 128 = GELU hidden layer; 0 = previous linear head
 HEAD_DROPOUT = 0.10
@@ -538,13 +547,8 @@ class BertClassifier:
         return result, counts
 
     def fit(self, texts, labels, sample_weight=None, checkpoint_dir=None, validation_data=None,
-            preflight_only=False, *, eval_every_batches=0, evaluation_callback=None):
+            preflight_only=False):
         self._validate_settings()
-        if (isinstance(eval_every_batches, bool)
-                or not isinstance(eval_every_batches, (int, np.integer)) or eval_every_batches < 0):
-            raise ValueError("eval_every_batches must be a nonnegative integer; 0 means epoch-end only.")
-        if evaluation_callback is not None and not callable(evaluation_callback):
-            raise ValueError("evaluation_callback must be callable or None.")
         texts = _texts(texts)
         labels = _labels(labels, len(texts))
         self.classes_, targets = np.unique(labels, return_inverse=True)
@@ -645,48 +649,12 @@ class BertClassifier:
             logger.info("%s [%s/%s]: %d rows, %d classes, max_length=%d, effective batch=%d, selection=%s",
                         self.name, self.backend_, self.device, len(texts), len(self.classes_), self.max_length,
                         self.batch_size * self.accumulation, self.training_text_counts)
-            if val_encoded and eval_every_batches:
-                logger.info("Full validation every %d training batches (after an optimizer update), "
-                            "plus epoch end. Early stopping/checkpoints remain epoch-based. "
-                            "Progress: %s", eval_every_batches, root / "validation_progress.jsonl")
-
-            def validate_progress(epoch, batch, kind):
-                logger.info("Validation starting: epoch %d/%d batch %d/%d (%s), %d rows",
-                            epoch + 1, self.epochs, batch, batches, kind, len(val_labels))
-                validation_started = perf_counter()
-                metrics, predicted = self._validation_metrics(val_encoded, val_labels)
-                progress = {"epoch": epoch + 1, "batch": batch, "batches_per_epoch": batches,
-                            "global_batch": epoch * batches + batch,
-                            "optimizer_step": state["global_step"], "kind": kind,
-                            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-                            "validation_rows": len(val_labels),
-                            "validation_seconds": perf_counter() - validation_started, **metrics}
-                logger.info("Validation epoch %d/%d batch %d/%d (%s): macro-F1 %.4f, "
-                            "weighted-F1 %.4f, accuracy %.4f, log-loss %.4f (%.1f s)",
-                            epoch + 1, self.epochs, batch, batches, kind,
-                            metrics["val_macro_f1"], metrics["val_weighted_f1"],
-                            metrics["val_accuracy"], metrics["val_log_loss"], progress["validation_seconds"])
-                # Monitoring must not discard trained weights if a log write fails.
-                try:
-                    with (root / "validation_progress.jsonl").open("a", encoding="utf-8") as stream:
-                        stream.write(json.dumps(progress, ensure_ascii=False, allow_nan=False) + "\n")
-                except OSError as exc:
-                    logger.warning("Could not append validation progress at %s: %s", root, exc)
-                if evaluation_callback is not None:
-                    try:
-                        evaluation_callback(dict(progress))
-                    except Exception as exc:
-                        logger.warning("Validation progress callback failed; training continues. "
-                                       "Local progress path: %s. Error: %s", root, exc)
-                return metrics, predicted
-
             for epoch in range(state["next_epoch"], self.epochs):
                 if state["stopped_early"]:
                     break
                 order = np.random.default_rng(self.seed + epoch).permutation(len(targets))
                 self._backend.start_epoch(epoch)
                 started, last_log, loss_sum, seen = perf_counter(), perf_counter(), 0.0, 0
-                next_validation_batch = eval_every_batches
                 for step, offset in enumerate(range(0, len(order), self.batch_size)):
                     indices = order[offset:offset + self.batch_size]
                     group_start = (step // self.accumulation) * self.accumulation * self.batch_size
@@ -697,13 +665,6 @@ class BertClassifier:
                     if (step + 1) % self.accumulation == 0 or step + 1 == batches:
                         self._backend.update(_lr_scale(state["global_step"], total_steps, self.warmup_ratio))
                         state["global_step"] += 1
-                        if (val_encoded and eval_every_batches and step + 1 >= next_validation_batch
-                                and step + 1 < batches):
-                            validate_progress(epoch, step + 1, "mid_epoch")
-                            # Skip already crossed thresholds, rather than repeating
-                            # validation on the same weights. The last batch is
-                            # evaluated once by the existing epoch-end path.
-                            next_validation_batch = ((step + 1) // eval_every_batches + 1) * eval_every_batches
                     if perf_counter() - last_log >= 30 or step + 1 == batches:
                         elapsed = perf_counter() - started
                         logger.info("%s epoch %d/%d batch %d/%d loss %.4f ETA %.1f min", self.name,
@@ -713,10 +674,16 @@ class BertClassifier:
                 record = {"epoch": epoch + 1, "train_loss": loss_sum / seen,
                           "seconds": perf_counter() - started}
                 if val_encoded:
-                    metrics, predicted = validate_progress(epoch, batches, "epoch_end")
-                    score = metrics["val_macro_f1"]
-                    record.update(metrics)
+                    probabilities = self._probabilities(val_encoded)
+                    predicted = self.classes_[probabilities.argmax(axis=1)]
+                    score = float(f1_score(val_labels, predicted, labels=self.classes_, average="macro", zero_division=0))
+                    record.update(val_macro_f1=score,
+                                  val_weighted_f1=float(f1_score(val_labels, predicted, average="weighted", zero_division=0)),
+                                  val_accuracy=float(accuracy_score(val_labels, predicted)),
+                                  val_log_loss=float(log_loss(val_labels, probabilities, labels=self.classes_)))
                     improved = state["best_score"] is None or score > state["best_score"] + self.min_delta
+                    logger.info("Validation: macro-F1 %.4f, weighted-F1 %.4f, accuracy %.4f", score,
+                                record["val_weighted_f1"], record["val_accuracy"])
                     # Retain diagnostics even if the subsequent checkpoint save fails.
                     diagnostics = {"metrics": record, "tokenizer": self.tokenizer_diagnostics_,
                                    "class_report": classification_report(
@@ -741,17 +708,6 @@ class BertClassifier:
         finally:
             if temporary is not None:
                 temporary.cleanup()
-
-    def _validation_metrics(self, encoded, labels):
-        # Inference only: no dropout, gradient updates or training-loss resets.
-        probabilities = self._probabilities(encoded)
-        predicted = self.classes_[probabilities.argmax(axis=1)]
-        metrics = {"val_macro_f1": float(f1_score(labels, predicted, labels=self.classes_,
-                                                average="macro", zero_division=0)),
-                   "val_weighted_f1": float(f1_score(labels, predicted, average="weighted", zero_division=0)),
-                   "val_accuracy": float(accuracy_score(labels, predicted)),
-                   "val_log_loss": float(log_loss(labels, probabilities, labels=self.classes_))}
-        return metrics, predicted
 
     def _probabilities(self, encoded):
         rows = []
@@ -865,6 +821,7 @@ EXCLUDED_TYPE_IDS = {32, 33, 34, 35, 36, 37, 38, 41, 42, 43, 44, 45}
 TEXT_COLUMN = "DESCRIPTION"
 LABEL_COLUMN = "WorkOrder_Info"
 GROUP_COLUMN = "NORMALIZED_DESCRIPTION"
+SYNTHETIC_COLUMN = "IS_SYNTHETIC"
 
 
 def bert_text(value):
@@ -931,10 +888,59 @@ def validate_type_mapping(frame):
             for name, type_id in pairs.itertuples(index=False, name=None)}
 
 
+def normalize_synthetic_flags(frame):
+    """Parse provenance without Python's bool('False') pitfall."""
+    frame = frame.copy()
+    matches = [name for name in frame.columns
+               if str(name).strip().casefold() == SYNTHETIC_COLUMN.casefold()]
+    if len(matches) > 1:
+        raise ValueError("Ambiguous repeated IS_SYNTHETIC columns.")
+    if not matches:
+        frame[SYNTHETIC_COLUMN] = False
+        logger.info("IS_SYNTHETIC column absent: treating all %d rows as real.", len(frame))
+        return frame
+    frame = frame.rename(columns={matches[0]: SYNTHETIC_COLUMN})
+    values = frame[SYNTHETIC_COLUMN].astype("string").str.strip().str.casefold()
+    accepted = {"true": True, "false": False, "1": True, "0": False,
+                "1.0": True, "0.0": False}
+    invalid = values.isna() | ~values.isin(accepted)
+    if invalid.any():
+        rows = frame.index[invalid].tolist()[:10]
+        raise ValueError(f"IS_SYNTHETIC contains missing/invalid flags at row indices {rows}. "
+                         "Use TRUE/FALSE or 1/0 for every row; blanks are not assumed real.")
+    frame[SYNTHETIC_COLUMN] = values.map(accepted).astype(bool)
+    return frame
+
+
+def resolve_split_ratios(args):
+    """Top-level rates are overall real-group fractions; retain legacy CLI semantics."""
+    ratios = {"train": TRAIN_RATIO, "validation": VALIDATION_RATIO, "test": TEST_RATIO}
+    for name, value in ratios.items():
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.number)) or not np.isfinite(value) or not 0 < value < 1:
+            raise ValueError(f"{name.upper()}_RATIO must be a finite number strictly between 0 and 1.")
+    if not math.isclose(sum(ratios.values()), 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError("TRAIN_RATIO + VALIDATION_RATIO + TEST_RATIO must equal 1.0.")
+    # Existing --validation-size means a fraction of the non-test pool.
+    # With no CLI overrides, only the three USER SETTINGS above control splitting.
+    test = TEST_RATIO if args.test_size is None else args.test_size
+    if not np.isfinite(test) or not 0 < test < 1:
+        raise ValueError("--test-size must be strictly between 0 and 1.")
+    validation = VALIDATION_RATIO
+    if args.validation_size is not None:
+        if not np.isfinite(args.validation_size) or not 0 < args.validation_size < 1:
+            raise ValueError("--validation-size must be strictly between 0 and 1.")
+        validation = (1.0 - test) * args.validation_size
+    train = 1.0 - test - validation
+    if train <= 0:
+        raise ValueError("The requested test and validation fractions leave no real training data.")
+    return {"train": float(train), "validation": float(validation), "test": float(test)}
+
+
 def clean_training_frame(frame, data_loader, min_class_count):
     required = {TEXT_COLUMN, LABEL_COLUMN, "TYPE_ID"}
     if missing := required - set(frame):
         raise ValueError(f"Training data is missing columns: {sorted(missing)}")
+    frame = normalize_synthetic_flags(frame)
     cleaned = frame.dropna(subset=sorted(required)).copy()
     ids = pd.to_numeric(cleaned["TYPE_ID"], errors="coerce")
     cleaned = cleaned.loc[ids.notna() & np.isfinite(ids) & ids.mod(1).eq(0)].copy()
@@ -947,7 +953,9 @@ def clean_training_frame(frame, data_loader, min_class_count):
     cleaned = cleaned.loc[eligible].copy()
     if "CREATED_DATE" in cleaned:
         cleaned["CREATED_DATE"] = pd.to_datetime(cleaned["CREATED_DATE"], errors="coerce", utc=True)
-        cleaned = cleaned.dropna(subset=["CREATED_DATE"])
+        # Synthetic templates often have no real ticket creation timestamp.
+        # Retain them; preserve the original date validity rule for real tickets.
+        cleaned = cleaned.loc[cleaned[SYNTHETIC_COLUMN] | cleaned["CREATED_DATE"].notna()].copy()
     cleaned[TEXT_COLUMN] = cleaned[TEXT_COLUMN].astype(str)
     cleaned[LABEL_COLUMN] = cleaned[LABEL_COLUMN].astype(str)
     usable = cleaned[TEXT_COLUMN].map(bert_text).ne("") & cleaned[LABEL_COLUMN].str.strip().ne("")
@@ -967,13 +975,16 @@ def clean_training_frame(frame, data_loader, min_class_count):
     if conflicts.any():
         logger.warning("%d normalized descriptions have conflicting labels; kept in one partition.", conflicts.sum())
     validate_type_mapping(cleaned)
-    logger.info("Cleaning: %d input rows -> %d rows / %d classes", len(frame), len(cleaned),
-                cleaned[LABEL_COLUMN].nunique())
+    logger.info("Cleaning: %d input rows -> %d rows / %d classes; real=%d synthetic=%d",
+                len(frame), len(cleaned), cleaned[LABEL_COLUMN].nunique(),
+                int((~cleaned[SYNTHETIC_COLUMN]).sum()), int(cleaned[SYNTHETIC_COLUMN].sum()))
     return cleaned
 
 
-def split_training_frame(frame, test_size, validation_size, seed):
-    """Match the RF outer split; choose validation only from outer training rows."""
+def _split_real_training_frame(frame, test_size, validation_size, seed):
+    """Use only real groups for both splits; validation_size is within non-test."""
+    if frame.empty or frame[GROUP_COLUMN].nunique() < 3:
+        raise ValueError("Need at least three distinct REAL description groups to split training/validation/test.")
     outer = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
     train_pool_idx, test_idx = next(outer.split(frame, groups=frame[GROUP_COLUMN]))
     pool, test = frame.iloc[train_pool_idx].copy(), frame.iloc[test_idx].copy()
@@ -1010,6 +1021,39 @@ def split_training_frame(frame, test_size, validation_size, seed):
             if left_text & right_text:
                 raise ValueError("Identical BERT input text crosses partitions; review normalize_description.")
     return partitions
+
+
+def split_training_frame(frame, test_size, validation_size, seed):
+    """Split real data first, then add only holdout-disjoint synthetic training rows."""
+    frame = normalize_synthetic_flags(frame)
+    real = frame.loc[~frame[SYNTHETIC_COLUMN]].copy()
+    synthetic = frame.loc[frame[SYNTHETIC_COLUMN]].copy()
+    real_train, validation, test = _split_real_training_frame(real, test_size, validation_size, seed)
+    heldout = pd.concat([validation, test])
+    heldout_text = set(heldout[TEXT_COLUMN].map(lambda text: bert_text(text).lower()))
+    blocked = synthetic[GROUP_COLUMN].isin(set(heldout[GROUP_COLUMN]))
+    blocked |= synthetic[TEXT_COLUMN].map(lambda text: bert_text(text).lower()).isin(heldout_text)
+    eligible_synthetic = synthetic.loc[~blocked].copy()
+    train = pd.concat([real_train, eligible_synthetic]).sort_index()
+    if missing := set(frame[LABEL_COLUMN]) - set(train[LABEL_COLUMN]):
+        raise ValueError(f"No leakage-safe training rows remain for {sorted(missing)}. "
+                         "Collect independent real training descriptions for those classes.")
+    if validation[SYNTHETIC_COLUMN].any() or test[SYNTHETIC_COLUMN].any():
+        raise RuntimeError("Synthetic rows reached an evaluation partition.")
+    for holdout in (validation, test):
+        if set(train[GROUP_COLUMN]) & set(holdout[GROUP_COLUMN]):
+            raise RuntimeError("Training descriptions overlap real evaluation groups.")
+        if set(train[TEXT_COLUMN].map(lambda text: bert_text(text).lower())) & set(
+                holdout[TEXT_COLUMN].map(lambda text: bert_text(text).lower())):
+            raise RuntimeError("Training BERT input text overlaps real evaluation text.")
+        missing = sorted(set(train[LABEL_COLUMN]) - set(holdout[LABEL_COLUMN]))
+        if missing:
+            logger.warning("A real-only holdout lacks %d training classes: %s; "
+                           "their recall cannot be measured on that holdout.", len(missing), missing)
+    logger.info("Real split: train=%d validation=%d test=%d; added synthetic training=%d; "
+                "excluded synthetic matching holdout=%d", len(real_train), len(validation), len(test),
+                len(eligible_synthetic), int(blocked.sum()))
+    return train, validation, test
 
 
 def cap_training_classes(train, max_rows, seed):
@@ -1149,8 +1193,10 @@ def build_parser():
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--class-weight", choices=["none", "balanced"], default=CLASS_WEIGHT_MODE)
     parser.add_argument("--threads", type=int, default=DEFAULT_THREADS)
-    parser.add_argument("--validation-size", type=float, default=.15, help="Fraction of outer training groups")
-    parser.add_argument("--test-size", type=float, help="Defaults to config.TEST_SIZE")
+    parser.add_argument("--validation-size", type=float,
+                        help="Optional legacy override: validation fraction of the REAL non-test pool; "
+                             "otherwise use top-level VALIDATION_RATIO as an overall fraction")
+    parser.add_argument("--test-size", type=float, help="Optional override for top-level TEST_RATIO (real groups)")
     parser.add_argument("--seed", type=int, help="Defaults to config.RANDOM_STATE")
     parser.add_argument("--min-class-count", type=int, default=75, help="Minimum cleaned rows per type name")
     parser.add_argument("--min-accuracy", type=float, default=.65, help="Existing registration gate")
@@ -1197,7 +1243,7 @@ def _project_path(value):
 def _read_local_csv(path):
     frame = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
     canonical = {name.casefold(): name for name in
-                 (TEXT_COLUMN, LABEL_COLUMN, "TYPE_ID", "TYPE_WO", "CREATED_DATE")}
+                 (TEXT_COLUMN, LABEL_COLUMN, "TYPE_ID", "TYPE_WO", "CREATED_DATE", SYNTHETIC_COLUMN)}
     frame.columns = [canonical.get(str(c).strip().casefold(), str(c).strip()) for c in frame.columns]
     if frame.columns.duplicated().any():
         raise ValueError(f"CSV contains ambiguous repeated column names: {path}")
@@ -1266,20 +1312,17 @@ def load_training_frame(args, data_loader):
     return frame
 
 
-def _log_progress_metrics(record):
-    """Keep live batch-step metrics separate from the existing epoch-step keys."""
-    mlflow.log_metrics({f"progress_{key}": float(value) for key, value in record.items()
-                        if key.startswith("val_")}, step=int(record["global_batch"]))
-
-
 def run_training(args, config, data_loader, mlflow_helpers):
     """Injectable project adapters also permit isolated integration testing."""
     if Version(mlflow.__version__) < Version("2.12.2"):
         raise RuntimeError("Source-based BERT packaging requires mlflow>=2.12.2 in training and serving.")
-    test_size = config.TEST_SIZE if args.test_size is None else args.test_size
+    ratios = resolve_split_ratios(args)
+    test_size = ratios["test"]
+    validation_size_within_train = ratios["validation"] / (1.0 - test_size)
     seed = config.RANDOM_STATE if args.seed is None else args.seed
-    if not 0 < test_size < 1 or not 0 < args.validation_size < 1:
-        raise ValueError("test-size and validation-size must be between 0 and 1.")
+    logger.info("Requested REAL group split: train=%.1f%% validation=%.1f%% test=%.1f%%; "
+                "synthetic rows are added to training afterward.",
+                100 * ratios["train"], 100 * ratios["validation"], 100 * ratios["test"])
     if not args.model_name.strip() or args.min_class_count < 1:
         raise ValueError("A model name and positive min-class-count are required.")
     for gate in (args.min_accuracy, args.min_macro_f1):
@@ -1325,11 +1368,13 @@ def run_training(args, config, data_loader, mlflow_helpers):
         mlflow.set_tags({"model_family": "tensorflow_bert_finetuned", "registration_status": "training",
                          "classification_target": LABEL_COLUMN})
         mlflow.log_params({**classifier._settings(), "model_name": args.model_name,
-                           "validate_every_batches": VALIDATE_EVERY_BATCHES,
-                           "validation_interval_unit": "training_microbatches_within_epoch",
-                           "early_stopping_scope": "epoch_end_validation_macro_f1",
                            "bert_source": str(source), "test_size": test_size,
-                           "validation_size_within_train": args.validation_size,
+                           "validation_size_within_train": validation_size_within_train,
+                           "real_train_ratio": ratios["train"],
+                           "real_validation_ratio": ratios["validation"],
+                           "real_test_ratio": ratios["test"],
+                           "evaluation_scope": "real_only",
+                           "synthetic_policy": "training_only_exclude_holdout_text_and_group_matches",
                            "data_source": str(_project_path(args.data_csv)) if args.data_csv else "project_tables",
                            "max_train_rows_per_type_id": MAX_TRAIN_ROWS_PER_TYPE_ID,
                            "sampling_scope": "training_only_after_group_split",
@@ -1345,23 +1390,55 @@ def run_training(args, config, data_loader, mlflow_helpers):
             raw = load_training_frame(args, data_loader)
             frame = clean_training_frame(raw, data_loader, args.min_class_count)
             del raw
-            train_before_cap, validation, test = split_training_frame(frame, test_size, args.validation_size, seed)
+            train_before_cap, validation, test = split_training_frame(
+                frame, test_size, validation_size_within_train, seed)
+            assigned_indices = train_before_cap.index.union(validation.index).union(test.index)
+            excluded_synthetic = frame.loc[~frame.index.isin(assigned_indices)].copy()
+            if not excluded_synthetic[SYNTHETIC_COLUMN].all():
+                raise RuntimeError("A real row was unexpectedly excluded by synthetic holdout protection.")
             train = cap_training_classes(train_before_cap, MAX_TRAIN_ROWS_PER_TYPE_ID, seed)
             excluded_by_cap = train_before_cap.loc[~train_before_cap.index.isin(train.index)]
             mapping = validate_type_mapping(frame)
+            real_train = train.loc[~train[SYNTHETIC_COLUMN]]
+            synthetic_train = train.loc[train[SYNTHETIC_COLUMN]]
+            real_train_before_cap = train_before_cap.loc[~train_before_cap[SYNTHETIC_COLUMN]]
+            real_count = int((~frame[SYNTHETIC_COLUMN]).sum())
+            split_summary = {
+                "policy": "real_only_validation_and_test; synthetic_training_only",
+                "requested_real_group_ratios": ratios,
+                "ratio_basis": "real_description_groups_before_augmentation_and_training_cap",
+                "actual_real_rows_before_cap": {"train": len(real_train_before_cap),
+                                                "validation": len(validation), "test": len(test)},
+                "actual_real_row_fractions_before_cap": {
+                    "train": len(real_train_before_cap) / real_count,
+                    "validation": len(validation) / real_count, "test": len(test) / real_count},
+                "train_rows": len(train), "train_real_rows": len(real_train),
+                "train_synthetic_rows": len(synthetic_train),
+                "validation_rows": len(validation), "validation_synthetic_rows": 0,
+                "test_rows": len(test), "test_synthetic_rows": 0,
+                "excluded_synthetic_holdout_overlap_rows": len(excluded_synthetic),
+                "excluded_by_training_cap_rows": len(excluded_by_cap),
+                "synthetic_provenance_limit": "IS_SYNTHETIC cannot identify paraphrases derived from held-out tickets",
+            }
+            write_json(output / "split_summary.json", split_summary)
             # Preserve row/group fingerprints to identify the exact evaluation split without logging ticket text.
             manifest_rows = []
             for partition_name, partition in (("train", train), ("validation", validation), ("test", test),
-                                               ("train_excluded_by_cap", excluded_by_cap)):
+                                               ("train_excluded_by_cap", excluded_by_cap),
+                                               ("synthetic_excluded_holdout_overlap", excluded_synthetic)):
                 for idx, row in partition.iterrows():
                     manifest_rows.append({"row": int(idx), "partition": partition_name,
                                           "description_sha256": hashlib.sha256(str(row[TEXT_COLUMN]).encode()).hexdigest(),
                                           "group_sha256": hashlib.sha256(str(row[GROUP_COLUMN]).encode()).hexdigest(),
-                                          "type_id": int(row["TYPE_ID"])})
+                                          "type_id": int(row["TYPE_ID"]),
+                                          "is_synthetic": bool(row[SYNTHETIC_COLUMN])})
             pd.DataFrame(manifest_rows).to_csv(output / "split_manifest.csv", index=False)
             distribution = pd.DataFrame({name: part[LABEL_COLUMN].value_counts()
                                          for name, part in (("train_before_cap", train_before_cap), ("train", train),
+                                                            ("train_real", real_train),
+                                                            ("train_synthetic", synthetic_train),
                                                             ("train_excluded_by_cap", excluded_by_cap),
+                                                            ("synthetic_excluded_holdout_overlap", excluded_synthetic),
                                                             ("validation", validation), ("test", test))}).fillna(0).astype(int)
             distribution.insert(0, "TYPE_ID", [mapping[name] for name in distribution.index])
             distribution.to_csv(output / "class_distribution.csv", index_label="workOrderType")
@@ -1369,15 +1446,18 @@ def run_training(args, config, data_loader, mlflow_helpers):
             # the exact holdout and sampled row identities available.
             mlflow.log_artifact(str(output / "split_manifest.csv"), artifact_path="training")
             mlflow.log_artifact(str(output / "class_distribution.csv"), artifact_path="training")
-            logger.info("Rows: train=%d validation=%d test=%d; classes=%d", len(train), len(validation), len(test), len(mapping))
+            mlflow.log_artifact(str(output / "split_summary.json"), artifact_path="training")
+            mlflow.log_metrics({"split_train_real_rows": len(real_train),
+                                "split_train_synthetic_rows": len(synthetic_train),
+                                "split_validation_real_rows": len(validation),
+                                "split_test_real_rows": len(test),
+                                "synthetic_excluded_holdout_overlap_rows": len(excluded_synthetic)})
+            logger.info("Rows: train=%d (real=%d synthetic=%d), validation=%d REAL ONLY, "
+                        "test=%d REAL ONLY; classes=%d", len(train), len(real_train), len(synthetic_train),
+                        len(validation), len(test), len(mapping))
             classifier.fit(train[TEXT_COLUMN].map(bert_text).tolist(), train[LABEL_COLUMN].tolist(),
                            validation_data=(validation[TEXT_COLUMN].map(bert_text).tolist(), validation[LABEL_COLUMN].tolist()),
-                           checkpoint_dir=checkpoint, preflight_only=args.preflight_only,
-                           eval_every_batches=VALIDATE_EVERY_BATCHES,
-                           evaluation_callback=_log_progress_metrics)
-            progress_path = checkpoint / "bert_training_state" / "validation_progress.jsonl"
-            if progress_path.is_file():
-                shutil.copyfile(progress_path, output / "validation_progress.jsonl")
+                           checkpoint_dir=checkpoint, preflight_only=args.preflight_only)
             write_json(output / "tokenizer_diagnostics.json", classifier.tokenizer_diagnostics_)
             mlflow.log_artifact(str(output / "tokenizer_diagnostics.json"), artifact_path="training")
             if args.preflight_only:
@@ -1395,16 +1475,14 @@ def run_training(args, config, data_loader, mlflow_helpers):
                        "source_fingerprint": classifier.source_fingerprint_,
                        "classification_target": LABEL_COLUMN, "type_name_to_id": mapping,
                        "allowed_type_ids": sorted(ALLOWED_TYPE_IDS), "excluded_type_ids": sorted(EXCLUDED_TYPE_IDS),
-                       "dataset": {"cleaned_rows": len(frame), "class_count": len(mapping)},
+                       "dataset": {"cleaned_rows": len(frame), "class_count": len(mapping),
+                                   "real_rows": real_count, "synthetic_rows": int(frame[SYNTHETIC_COLUMN].sum())},
                        "sampling": {"scope": "training_only", "max_rows_per_type_id": MAX_TRAIN_ROWS_PER_TYPE_ID,
                                     "train_rows_before_cap": len(train_before_cap), "excluded_rows": len(excluded_by_cap)},
-                       "split": {"train_rows": len(train), "validation_rows": len(validation), "test_rows": len(test)},
+                       "split": split_summary,
                        "best_epoch": classifier.best_epoch_,
                        "best_validation_macro_f1": classifier.best_validation_macro_f1_,
                        "stopped_early": classifier.stopped_early_, "training_text_counts": classifier.training_text_counts,
-                       "monitoring": {"validate_every_batches": VALIDATE_EVERY_BATCHES,
-                                      "interval_unit": "training_microbatches_within_epoch",
-                                      "selection_and_early_stopping": "epoch_end_only"},
                        "tokenizer_diagnostics": classifier.tokenizer_diagnostics_,
                        "metrics": metrics, "confidence_calibration": "uncalibrated_softmax",
                        "history": classifier.history_}
