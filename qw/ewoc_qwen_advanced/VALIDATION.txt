@@ -1,0 +1,26 @@
+Validation performed 2026-10-16 UTC
+Python in preparation environment: 3.12.14
+
+PASS: 13 Python files parsed/compiled.
+PASS: selfcheck.py: 12 CPU integrity checks.
+  - grouped partitions are disjoint and reproducible
+  - contradictory labels are quarantined
+  - duplicate normalization preserves transitive EWOC_ID connections
+  - optional template grouping links identifier variants
+  - evaluation overlap is rejected
+  - CSV round trip preserves data
+  - lexical retrieval and group exclusion work
+  - index cannot be silently overwritten
+  - completion-only training labels mask prompt tokens
+  - context budget drops demonstrations before query content
+  - long query preserves start/end
+  - invalid predictions count as errors
+PASS: --help for eight CLI entry points (prepare/index/classify/evaluate/train/select/merge/API).
+PASS: End-to-end CPU fixture: 240 synthetic tickets -> 144 train/48 validation/48 test,
+      training-only lexical index, zero holdout overlap, 48 held-out retrieval queries.
+      These synthetic fixtures exercise correctness, not real-world model accuracy.
+
+NOT EXECUTED: CUDA, vLLM generation, dense embedding forward pass, neural reranking,
+             LoRA/QLoRA training, checkpoint inference selection, model merge, live API.
+Reason: This preparation environment has no torch/CUDA, model weights, or user CSV.
+No measured EWOC accuracy gain, runtime, or H100 memory claim is made.
