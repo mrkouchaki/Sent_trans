@@ -1,9 +1,0 @@
-# Separate Linux/Python 3.11 environment; use approved CUDA-enabled torch wheels.
--r requirements-core.txt
-torch>=2.6,<3
-transformers>=4.57,<5
-peft>=0.17,<0.19
-accelerate>=1.6,<2
-bitsandbytes>=0.46,<1
-safetensors>=0.5,<1
-sentence-transformers>=5,<6
