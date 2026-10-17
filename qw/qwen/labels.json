@@ -1,0 +1,67 @@
+{
+  "1": {
+    "name": "Call Test Validation",
+    "definition": "Review or verify results of E911 test calls that have already been performed, including whether calls reached the intended PSAP and whether call test results are acceptable.",
+    "definition_status": "draft_needs_review"
+  },
+  "2": {
+    "name": "E911 Provisioning",
+    "definition": "Provision or load E911 service configuration for sites, cells or sectors. Select this when the main requested action is provisioning; a general mention of E911, a PSAP, or an update does not by itself establish this class.",
+    "definition_status": "draft_needs_review"
+  },
+  "3": {
+    "name": "Expedite Request",
+    "definition": "Expedite or prioritize an existing request or work order, usually to meet a requested deadline or launch date. The main action is acceleration or priority handling.",
+    "definition_status": "draft_needs_review"
+  },
+  "5": {
+    "name": "Other",
+    "definition": "A substantive request outside the other configured EWOC categories under the reviewed business taxonomy. Do not treat this as a default solely because the description is short or unclear.",
+    "definition_status": "draft_needs_review"
+  },
+  "6": {
+    "name": "Prelaunch Correction",
+    "definition": "Correct an identified configuration, audit, approval or data issue in the prelaunch stage. The request should contain prelaunch context and an action to correct a specific problem.",
+    "definition_status": "draft_needs_review"
+  },
+  "9": {
+    "name": "Testing Coordination",
+    "definition": "Arrange or coordinate future testing: schedule a test window, obtain PSAP approval or contacts, or coordinate participants and resources for E911 testing.",
+    "definition_status": "draft_needs_review"
+  },
+  "11": {
+    "name": "Soft Test Tool Test",
+    "definition": "Perform or handle a test explicitly associated with the named Soft Test Tool workflow, including running the tool or reviewing its output. A generic reference to testing is insufficient by itself.",
+    "definition_status": "draft_needs_review"
+  },
+  "13": {
+    "name": "Sector Deletion",
+    "definition": "Delete, remove, retire or decommission E911 sector records. Cleanup belongs here when removal of sector records is actually requested; the word cleanup alone does not specify the action.",
+    "definition_status": "draft_needs_review"
+  },
+  "16": {
+    "name": "RBSS Lat/Long Update",
+    "definition": "Update or correct latitude/longitude associated with an RBSS or site record in that workflow. Generic coordinates mentioned as part of another task, including BMC/WEA, do not establish this class by themselves.",
+    "definition_status": "draft_needs_review"
+  },
+  "20": {
+    "name": "Small Cell DALI and ECDM load",
+    "definition": "Load, fill, verify or update DALI and/or ECDM data specifically for a small-cell workflow.",
+    "definition_status": "draft_needs_review"
+  },
+  "26": {
+    "name": "Direct IP PSAP Conversion",
+    "definition": "Convert a PSAP routing or connectivity arrangement to Direct IP. The requested conversion and its associated routing or provisioning work should be central to the ticket.",
+    "definition_status": "draft_needs_review"
+  },
+  "28": {
+    "name": "PSAP Consolidation",
+    "definition": "Consolidate or merge PSAP destinations or arrangements and perform the associated record or routing changes. The consolidation itself should be the main requested change.",
+    "definition_status": "draft_needs_review"
+  },
+  "40": {
+    "name": "BMC/WEA",
+    "definition": "Handle a request explicitly associated with BMC/WEA configuration, maintenance or updates. Confirm the BMC/WEA workflow context; a generic latitude/longitude or E911 configuration update alone is not sufficient.",
+    "definition_status": "draft_needs_review"
+  }
+}
