@@ -1,0 +1,54 @@
+{
+  "1": {
+    "name": "Call Test Validation",
+    "definition": ""
+  },
+  "2": {
+    "name": "E911 Provisioning",
+    "definition": ""
+  },
+  "3": {
+    "name": "Expedite Request",
+    "definition": ""
+  },
+  "5": {
+    "name": "Other",
+    "definition": ""
+  },
+  "6": {
+    "name": "Prelaunch Correction",
+    "definition": ""
+  },
+  "9": {
+    "name": "Testing Coordination",
+    "definition": ""
+  },
+  "11": {
+    "name": "Soft Test Tool Test",
+    "definition": ""
+  },
+  "13": {
+    "name": "Sector Deletion",
+    "definition": ""
+  },
+  "16": {
+    "name": "RBSS Lat/Long Update",
+    "definition": ""
+  },
+  "20": {
+    "name": "Small Cell DALI and ECDM load",
+    "definition": ""
+  },
+  "26": {
+    "name": "Direct IP PSAP Conversion",
+    "definition": ""
+  },
+  "28": {
+    "name": "PSAP Consolidation",
+    "definition": ""
+  },
+  "40": {
+    "name": "BMC/WEA",
+    "definition": ""
+  }
+}
