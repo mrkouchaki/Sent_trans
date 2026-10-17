@@ -1,0 +1,2 @@
+# Install ONLY if you deliberately enable an embedding model or neural reranker.
+sentence-transformers>=5,<6
